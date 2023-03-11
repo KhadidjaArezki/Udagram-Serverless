@@ -1,0 +1,448 @@
+service: hadhadgram-serverless
+frameworkVersion: "3"
+
+plugins:
+  - serverless-webpack
+  - serverless-plugin-canary-deployments
+  - serverless-iam-roles-per-function
+  - serverless-dynamodb-local
+  - serverless-offline
+
+# Uncomment if you choose to package an individual function's code with its dependencies only.
+# This operation requires more memory for the NodeJS process because of the longer compilation time.
+# Configure the NODE_OPTIONS shell variable by running the following command: 
+# `export NODE_OPTIONS=--max_old_space_size=4096`
+
+#package:
+ # individually: true
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  tracing:
+    lambda: true
+    apiGateway: true
+
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+
+  environment:
+    GROUPS_TABLE: Groups-${self:provider.stage}
+    IMAGES_TABLE: Images-${self:provider.stage}
+    CONNECTIONS_TABLE: Connections-${self:provider.stage}
+    IMAGE_ID_INDEX: ImageIdIndex
+    IMAGES_S3_BUCKET: serverless-hadhadgram-images-${self:provider.stage}
+    THUMBNAILS_S3_BUCKET: serverless-hadhadgram-thumbnails-${self:provider.stage}
+    SIGNED_URL_EXPIRATION: 300
+    AUTH0_SECRET_ID: Auth0Secret-${self:provider.stage}
+    AUTH0_SECRET_FIELD: auth0Secret
+
+  httpApi:
+    cors: true
+
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - dynamodb:Scan
+        - dynamodb:PutItem
+        - dynamodb:GetItem
+      Resource:
+        - !Sub arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.GROUPS_TABLE}
+
+    - Effect: Allow
+      Action:
+        - dynamodb:Query
+        - dynamodb:PutItem
+      Resource:
+        - !Sub arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.IMAGES_TABLE}
+
+    - Effect: Allow
+      Action:
+        - dynamodb:Query
+      Resource:
+        - !Sub arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.IMAGES_TABLE}/index/${self:provider.environment.IMAGE_ID_INDEX}
+
+    - Effect: Allow
+      Action:
+        - s3:PutObject
+        - s3:GetObject
+      Resource: arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}/*
+
+    - Effect: Allow
+      Action:
+        - s3:PutObject
+      Resource: arn:aws:s3:::${self:provider.environment.THUMBNAILS_S3_BUCKET}/*
+
+    - Effect: Allow
+      Action:
+        - dynamodb:Scan
+        - dynamodb:PutItem
+        - dynamodb:DeleteItem
+      Resource:
+        - !Sub arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.CONNECTIONS_TABLE}
+
+    - Effect: Allow
+      Action:
+        - secretsmanager:GetSecretValue
+      Resource: !Ref Auth0Secret
+
+    - Effect: Allow
+      Action:
+        - kms:Decrypt
+      Resource: !GetAtt KMSKey.Arn
+      
+    - Effect: Allow
+      Action:
+        - codedeploy:*
+      Resource: '*'
+
+functions:
+  #RS256Auth:
+   # handler: src/lambda/auth/rs256Auth0Authorizer.handler
+
+  Auth:
+    handler: src/lambda/auth/auth0Authorizer.handler
+
+  getGroups:
+    handler: src/lambda/http/getGroups.handler
+    events:
+      - http:
+          path: /groups
+          method: get
+
+  createGroup:
+    handler: src/lambda/http/createGroup.handler
+    events:
+      - http:
+          path: /groups
+          method: post
+          authorizer: Auth
+          request:
+            schemas:
+              application/json: ${file(models/create-group-model.json)}
+    # UnComment if you wish to enable canary deployment for this function 
+    #deploymentSettings:
+    #  type: Linear10PercentEvery1Minute
+    #  alias: Live
+
+  getGroupImages:
+    handler: src/lambda/http/getGroupImages.handler
+    events:
+      - http:
+          method: get
+          path: /groups/{groupId}/images
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+        Resource:
+          - !Sub arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.GROUPS_TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource:
+          - !Sub arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.IMAGES_TABLE}
+
+  getImage:
+    handler: src/lambda/http/getImage.handler
+    events:
+      - http:
+          method: get
+          path: /images/{imageId}
+
+  createImage:
+    handler: src/lambda/http/createImage.handler
+    events:
+      - http:
+          path: /groups/{groupId}/images
+          method: post
+          authorizer: Auth
+          request:
+            schemas:
+              application/json: ${file(models/create-image-model.json)}
+
+  sendUploadNotifications:
+    environment:
+      STAGE: ${self:provider.stage}
+      API_ID:
+        Ref: WebsocketsApi
+    handler: src/lambda/s3/sendNotifications.handler
+    events:
+      - sns:
+          arn:
+            Fn::Join: # use the Join function to create an arn of the sns topic
+              - ":"
+              - - arn:aws:sns
+                - Ref: AWS::Region
+                - Ref: AWS::AccountId
+                - ${self:custom.topicName}
+          topicName: ${self:custom.topicName}
+
+  resizeImage:
+    environment:
+      STAGE: ${self:provider.stage}
+      API_ID:
+        Ref: WebsocketsApi
+    handler: src/lambda/s3/resizeImage.handler
+    events:
+      - sns:
+          arn:
+            Fn::Join:
+              - ":"
+              - - arn:aws:sns
+                - Ref: AWS::Region
+                - Ref: AWS::AccountId
+                - ${self:custom.topicName}
+          topicName: ${self:custom.topicName}
+  
+  # In order to test our web socket, you can use a tool called `wscat` which provides a web socket cli client.
+  # Connect to the web socket API by running: `wscat -c <your_websocket_url>`
+  # After establishing the connection, you can receive messages from the socket endpoint
+  # To send messages, type in the prompt and press enter.
+  connectHandler:
+    handler: src/lambda/websocket/connect.handler
+    events:
+      - websocket:
+          route: $connect
+
+  disconnectHandler:
+    handler: src/lambda/websocket/disconnect.handler
+    events:
+      - websocket:
+          route: $disconnect
+          
+  # Uncomment this to sync ElasticSearch cluster and DynamoDB stream
+  # syncWithElasticsearch:
+  # environment:
+  # ES_ENDPOINT: !GetAtt ImagesSearch.DomainEndpoint
+  # handler: src/lambda/dynamodb/elasticSearchSync.handler
+  # events:
+  # - stream: # listen to dynamodb stream events
+  # type: dynamodb
+  # arn: !GetAtt ImagesDynamoDBTable.StreamArn
+
+custom:
+  topicName: imagesTopic-${self:provider.stage}
+  
+  serverless-offline:
+    port: 3003
+  
+  dynamodb:
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true
+    stages:
+      - dev
+
+resources:
+  Resources:
+    # Provide correct cors headers if our custom authorizer denies access to a lambda function
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS,POST'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: ApiGatewayRestApi
+
+    RequestBodyValidator:
+      Type: AWS::ApiGateway::RequestValidator
+      Properties:
+        Name: "request-body-validator"
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        ValidateRequestBody: true
+        ValidateRequestParameters: false
+
+    GroupsDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.GROUPS_TABLE}
+
+    ImagesDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: groupId
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+          - AttributeName: imageId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: groupId
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.IMAGE_ID_INDEX}
+            KeySchema:
+              - AttributeName: imageId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL # What attributes will be copied to an index
+        BillingMode: PAY_PER_REQUEST
+        StreamSpecification: # enable dynamodb updates stream
+          StreamViewType: NEW_IMAGE # stream record will only contain the updated version of the dynamodb item
+        TableName: ${self:provider.environment.IMAGES_TABLE}
+
+    ConnectionsDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.CONNECTIONS_TABLE}
+
+    AttachmentsBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: SNSTopicPolicy
+      Properties:
+        BucketName: ${self:provider.environment.IMAGES_S3_BUCKET}
+        NotificationConfiguration:
+          TopicConfigurations:
+            - Event: s3:ObjectCreated:Put
+              Topic: !Ref ImagesTopic
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - "*"
+              AllowedHeaders:
+                - "*"
+              AllowedMethods:
+                - GET
+                - POST
+                - PUT
+                - DELETE
+                - HEAD
+              MaxAge: 3000
+
+    # Allow users to read objects from our bucket
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        PolicyDocument:
+          Id: MyPolicy
+          Version: "2012-10-17"
+          Statement:
+            - Sid: PublicReadForGetBucketObjects
+              Effect: Allow
+              Principal: "*"
+              Action: "s3:GetObject"
+              Resource: "arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}/*"
+        Bucket: !Ref AttachmentsBucket
+
+    ThumbnailsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.THUMBNAILS_S3_BUCKET}
+
+    # add permission for our bucket to call the lambda function
+    SendUploadNotificationsPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !Ref SendUploadNotificationsLambdaFunction
+        Principal: s3.amazonaws.com
+        Action: lambda:InvokeFunction
+        SourceAccount: !Ref AWS::AccountId
+        SourceArn: arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}
+
+    # receive messages from our bucket
+    SNSTopicPolicy:
+      Type: AWS::SNS::TopicPolicy
+      Properties:
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                AWS: "*"
+              Action: sns:Publish
+              Resource: !Ref ImagesTopic
+              Condition:
+                ArnLike:
+                  AWS:SourceArn: arn:aws:s3:::${self:provider.environment.IMAGES_S3_BUCKET}
+        Topics:
+          - !Ref ImagesTopic
+
+    ImagesTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        DisplayName: Image bucket topic # publisher logical name
+        TopicName: ${self:custom.topicName}
+
+    # Uncomment this to create the ElasticSearch cluster
+    # ImagesSearch:
+    # Type: AWS::Elasticsearch::Domain
+    # Properties:
+    # ElasticsearchVersion: '6.3'
+    # DomainName: images-search-${self:provider.stage}
+    # ElasticsearchClusterConfig:
+    # DedicatedMasterEnabled: false
+    # InstanceCount: '1'
+    # ZoneAwarenessEnabled: false
+    # InstanceType: t2.small.elasticsearch
+    # EBSOptions: # Elastic Block Store - defines a storage for our cluster
+    # EBSEnabled: true
+    # Iops: 0
+    # VolumeSize: 10
+    # VolumeType: 'gp2'
+    #
+    # AccessPolicies: # allow access to the Elasticsearch cluster
+    # Version: '2012-10-17'
+    # Statement:
+    # - # we can add permissions to specify who can write/read to the cluster and restrict access to Kibana
+    # Effect: Allow
+    # Principal:
+    # AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/get-groups-serverless-dev-us-east-1-lambdaRole
+    # Action: 'es:*'
+    # Resource: '*'
+
+    KMSKey:
+      Type: AWS::KMS::Key
+      Properties:
+        Description: KMS key to encrypt Auth0 secret
+        KeyPolicy:
+          Version: "2012-10-17"
+          Id: key-default-1
+          Statement:
+            - Sid: Allow administration of the key
+              Effect: Allow
+              Principal:
+                AWS:
+                  Fn::Join:
+                    - ":"
+                    - - "arn:aws:iam:"
+                      - Ref: AWS::AccountId
+                      - "root"
+              Action:
+                - "kms:*"
+              Resource: "*"
+
+    KMSKeyAlias:
+      Type: AWS::KMS::Alias
+      Properties:
+        AliasName: alias/auth0Key-${self:provider.stage}
+        TargetKeyId: !Ref KMSKey
+
+    Auth0Secret:
+      Type: AWS::SecretsManager::Secret # create a new AWS Secrets Manager store and add our Auth0 secret
+      Properties:
+        Name: ${self:provider.environment.AUTH0_SECRET_ID}
+        Description: Auth0 secret
+        KmsKeyId: !Ref KMSKey # use the created key to encrypt the secret
